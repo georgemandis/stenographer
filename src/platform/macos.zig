@@ -69,17 +69,40 @@ const tap_block_descriptor = BlockDescriptor{
 // Module-level state
 // ---------------------------------------------------------------------------
 var recognition_done: bool = false;
-var recognition_text: ?[]const u8 = null;
+var recognition_text: ?[]const u8 = null; // used by transcribeFile
+var recognition_text_changed: bool = false; // used by transcribeFile
 var recognition_error: bool = false;
 var auth_completed: bool = false;
 var auth_status: objc.NSInteger = 0;
 var current_run_loop: ?*anyopaque = null;
+var log_callback: ?*const fn (msg: []const u8) void = null;
+// When true, the callback ignores all events (used during task restart drain)
+var ignore_callbacks: bool = false;
+// Audio tap counter: incremented every time the mic tap fires
+var audio_tap_count: u64 = 0;
 
-// For live mic: the audio buffer recognition request
+// --- Simple captured text ---
+// captured_buf holds: [text from previous tasks] + \n + [current task's text]
+// On every callback, we replace the current task's portion with Apple's latest.
+// The streaming callback only advances when total length grows.
+var captured_buf: [32768]u8 = undefined;
+var captured_len: usize = 0;
+// Where the current utterance's text region starts
+var captured_base_len: usize = 0;
+var captured_changed: bool = false;
+// Length of Apple's text in the previous callback (to detect new utterances)
+var prev_apple_text_len: usize = 0;
+
+// For live mic: the audio buffer recognition request and task
 var live_recognition_request: ?objc.id = null;
+var live_recognition_task: ?objc.id = null;
 // Static blocks for mic capture (must survive across threads)
 var static_tap_block: TapBlockLiteral = undefined;
 var static_recognition_block: RecognitionBlockLiteral = undefined;
+
+fn log(msg: []const u8) void {
+    if (log_callback) |cb| cb(msg);
+}
 
 // ---------------------------------------------------------------------------
 // Block callbacks
@@ -88,19 +111,32 @@ var static_recognition_block: RecognitionBlockLiteral = undefined;
 fn recognitionBlockInvoke(block: *RecognitionBlockLiteral, result: ?objc.id, err: ?objc.id) callconv(.c) void {
     _ = block;
 
-    if (err != null) {
-        // If we already have partial text, keep it and mark done
-        recognition_error = recognition_text == null;
+    // During task restart, we ignore all callbacks (they're from the old task)
+    if (ignore_callbacks) {
+        log("[verbose] ignoring callback from old task during restart");
+        return;
+    }
+
+    if (err) |e| {
+        if (log_callback != null) {
+            const desc = objc.msgSend(objc.id, e, objc.sel("localizedDescription"), .{});
+            const desc_cstr = objc.fromNSString(desc);
+            if (desc_cstr) |cs| {
+                const slice = std.mem.sliceTo(cs, 0);
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "[verbose] recognition error: {s}", .{slice}) catch "[verbose] recognition error: (too long)";
+                log(msg);
+            }
+        }
+        recognition_error = captured_len == 0;
         recognition_done = true;
         if (current_run_loop) |rl| CFRunLoopStop(rl);
         return;
     }
 
     if (result) |res| {
-        // Check if this is the final result
         const is_final = objc.msgSend(bool, res, objc.sel("isFinal"), .{});
 
-        // Get bestTranscription.formattedString
         const transcription = objc.msgSend(objc.id, res, objc.sel("bestTranscription"), .{});
         const formatted = objc.msgSend(objc.id, transcription, objc.sel("formattedString"), .{});
         const cstr = objc.fromNSString(formatted) orelse {
@@ -111,22 +147,39 @@ fn recognitionBlockInvoke(block: *RecognitionBlockLiteral, result: ?objc.id, err
             return;
         };
 
-        const slice = std.mem.sliceTo(cstr, 0);
+        const apple_text = std.mem.sliceTo(cstr, 0);
 
-        // Free previous partial result
+        // Update recognition_text (used by transcribeFile for non-live mode)
         if (recognition_text) |prev| {
             std.heap.c_allocator.free(@constCast(prev));
         }
+        recognition_text = std.heap.c_allocator.dupe(u8, apple_text) catch null;
+        recognition_text_changed = true;
 
-        recognition_text = std.heap.c_allocator.dupe(u8, slice) catch {
-            if (is_final) {
-                recognition_done = true;
-                if (current_run_loop) |rl| CFRunLoopStop(rl);
-            }
-            return;
-        };
+        // --- Simple capture: replace current utterance, advance base on new utterance ---
+        // When Apple's text gets shorter, it means a new utterance started
+        // (the iOS 18 regression bug, or a natural pause). Lock in what we had
+        // and start the new utterance after it.
+        if (apple_text.len < prev_apple_text_len and prev_apple_text_len > 0) {
+            // New utterance — advance base to lock in previous text
+            captured_base_len = captured_len;
+        }
+        prev_apple_text_len = apple_text.len;
+
+        // Write current utterance after the base
+        const sep_len: usize = if (captured_base_len > 0) 1 else 0;
+        const write_start = captured_base_len + sep_len;
+        const avail = if (write_start < captured_buf.len) captured_buf.len - write_start else 0;
+        const copy_len = @min(apple_text.len, avail);
+        if (sep_len > 0) {
+            captured_buf[captured_base_len] = '\n';
+        }
+        @memcpy(captured_buf[write_start .. write_start + copy_len], apple_text[0..copy_len]);
+        captured_len = write_start + copy_len;
+        captured_changed = true;
 
         if (is_final) {
+            log("[verbose] recognition callback: isFinal=true");
             recognition_done = true;
             if (current_run_loop) |rl| CFRunLoopStop(rl);
         }
@@ -143,6 +196,8 @@ fn authBlockInvoke(block: *AuthBlockLiteral, status: objc.NSInteger) callconv(.c
 fn tapBlockInvoke(block: *TapBlockLiteral, buffer: objc.id, when: objc.id) callconv(.c) void {
     _ = block;
     _ = when;
+
+    audio_tap_count += 1;
 
     // Feed audio buffer to the recognition request
     if (live_recognition_request) |request| {
@@ -281,42 +336,12 @@ pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []
 // Public API: listen (live mic)
 // ---------------------------------------------------------------------------
 
-pub fn listen(allocator: std.mem.Allocator, locale: []const u8, duration_ms: u32, on_device: bool) speech.SpeechError!speech.TranscriptionResult {
-    const pool = objc.autoreleasePoolPush();
-    defer objc.autoreleasePoolPop(pool);
-
-    try ensureAuthorized();
-
-    // Reset state
-    recognition_done = false;
-    recognition_text = null;
-    recognition_error = false;
-
-    // Create recognizer
-    const recognizer = createRecognizer(locale) orelse
-        return speech.SpeechError.FrameworkUnavailable;
-
-    const is_available = objc.msgSend(bool, recognizer, objc.sel("isAvailable"), .{});
-    if (!is_available) return speech.SpeechError.FrameworkUnavailable;
-
-    // Create AVAudioEngine
-    const AVAudioEngine = objc.getClass("AVAudioEngine") orelse
-        return speech.SpeechError.FrameworkUnavailable;
-    const engine_alloc = objc.msgSend(objc.id, AVAudioEngine, objc.sel("alloc"), .{});
-    const engine = objc.msgSend(objc.id, engine_alloc, objc.sel("init"), .{});
-
-    // Get input node and format
-    const input_node = objc.msgSend(objc.id, engine, objc.sel("inputNode"), .{});
-    const format = objc.msgSend(objc.id, input_node, objc.sel("outputFormatForBus:"), .{@as(objc.NSUInteger, 0)});
-
-    // Create SFSpeechAudioBufferRecognitionRequest
+fn startRecognitionTask(recognizer: objc.id, on_device: bool) ?objc.id {
     const SFSpeechAudioBufferRecognitionRequest = objc.getClass("SFSpeechAudioBufferRecognitionRequest") orelse
-        return speech.SpeechError.FrameworkUnavailable;
+        return null;
     const request_alloc = objc.msgSend(objc.id, SFSpeechAudioBufferRecognitionRequest, objc.sel("alloc"), .{});
     const request = objc.msgSend(objc.id, request_alloc, objc.sel("init"), .{});
-    live_recognition_request = request;
 
-    // Set on-device if requested
     if (on_device) {
         const supports_on_device = objc.msgSend(bool, recognizer, objc.sel("supportsOnDeviceRecognition"), .{});
         if (supports_on_device) {
@@ -324,26 +349,12 @@ pub fn listen(allocator: std.mem.Allocator, locale: []const u8, duration_ms: u32
         }
     }
 
-    // Enable partial results for streaming
     objc.msgSend(void, request, objc.sel("setShouldReportPartialResults:"), .{@as(bool, true)});
+    // Hint that this is dictation (value 1), not search — improves behavior for continuous speech
+    objc.msgSend(void, request, objc.sel("setTaskHint:"), .{@as(objc.NSInteger, 1)});
 
-    // Install tap on audio input (GlobalBlock since it's module-level static)
-    static_tap_block = .{
-        .isa = @ptrCast(&_NSConcreteGlobalBlock),
-        .flags = 0,
-        .reserved = 0,
-        .invoke = &tapBlockInvoke,
-        .descriptor = &tap_block_descriptor,
-    };
+    live_recognition_request = request;
 
-    objc.msgSend(void, input_node, objc.sel("installTapOnBus:bufferSize:format:block:"), .{
-        @as(objc.NSUInteger, 0),
-        @as(u32, 1024),
-        format,
-        @as(objc.id, @ptrCast(&static_tap_block)),
-    });
-
-    // Use static recognition block with GlobalBlock ISA (must survive across callback threads)
     static_recognition_block = .{
         .isa = @ptrCast(&_NSConcreteGlobalBlock),
         .flags = 0,
@@ -352,55 +363,253 @@ pub fn listen(allocator: std.mem.Allocator, locale: []const u8, duration_ms: u32
         .descriptor = &recognition_block_descriptor,
     };
 
-    // Start recognition task BEFORE starting audio engine
-    current_run_loop = CFRunLoopGetCurrent();
-    _ = objc.msgSend(objc.id, recognizer, objc.sel("recognitionTaskWithRequest:resultHandler:"), .{
+    const task = objc.msgSend(objc.id, recognizer, objc.sel("recognitionTaskWithRequest:resultHandler:"), .{
         request,
         @as(objc.id, @ptrCast(&static_recognition_block)),
     });
+    live_recognition_task = task;
 
-    // Start audio engine
-    var start_err: ?objc.id = null;
-    const started = objc.msgSend(bool, engine, objc.sel("startAndReturnError:"), .{&start_err});
-    if (!started) {
-        live_recognition_request = null;
-        current_run_loop = null;
-        return speech.SpeechError.MicrophoneUnavailable;
+    return request;
+}
+
+/// Cancel the current recognition task and drain its pending callbacks.
+/// The audio engine/tap stays running throughout.
+fn cancelCurrentTask(request: objc.id) void {
+    // Mute the callback so any belated invocations from the dying task are ignored
+    ignore_callbacks = true;
+
+    if (live_recognition_task) |task| {
+        objc.msgSend(void, task, objc.sel("cancel"), .{});
+        live_recognition_task = null;
     }
-
-    // Listen for specified duration, pumping run loop for recognition callbacks
-    const duration_seconds: f64 = if (duration_ms > 0)
-        @as(f64, @floatFromInt(duration_ms)) / 1000.0
-    else
-        10.0;
-
-    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration_seconds, false);
-
-    // Stop audio capture
-    objc.msgSend(void, input_node, objc.sel("removeTapOnBus:"), .{@as(objc.NSUInteger, 0)});
-    objc.msgSend(void, engine, objc.sel("stop"), .{});
-
-    // Signal end of audio to the recognition request
     objc.msgSend(void, request, objc.sel("endAudio"), .{});
     live_recognition_request = null;
 
-    // Wait for final result (pump run loop for callbacks to fire)
-    if (!recognition_done) {
-        _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10.0, false);
-    }
-    current_run_loop = null;
+    // Drain: pump the run loop so any pending callbacks fire (and get ignored)
+    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
 
-    // Accept partial results even if not final
-    if (recognition_text == null) {
+    // Reset all state for the next task
+    recognition_done = false;
+    recognition_error = false;
+    recognition_text_changed = false;
+
+    // Unmute
+    ignore_callbacks = false;
+}
+
+/// Build a complete audio pipeline from scratch: engine + tap + recognizer + task.
+/// Returns null on failure.
+const AudioPipeline = struct {
+    engine: objc.id,
+    input_node: objc.id,
+    recognizer: objc.id,
+    request: objc.id,
+};
+
+fn buildPipeline(opts: speech.ListenOptions) ?AudioPipeline {
+    const AVAudioEngine = objc.getClass("AVAudioEngine") orelse return null;
+    const engine = objc.msgSend(objc.id, objc.msgSend(objc.id, AVAudioEngine, objc.sel("alloc"), .{}), objc.sel("init"), .{});
+    const input_node = objc.msgSend(objc.id, engine, objc.sel("inputNode"), .{});
+    const format = objc.msgSend(objc.id, input_node, objc.sel("outputFormatForBus:"), .{@as(objc.NSUInteger, 0)});
+
+    static_tap_block = .{
+        .isa = @ptrCast(&_NSConcreteGlobalBlock),
+        .flags = 0,
+        .reserved = 0,
+        .invoke = &tapBlockInvoke,
+        .descriptor = &tap_block_descriptor,
+    };
+    objc.msgSend(void, input_node, objc.sel("installTapOnBus:bufferSize:format:block:"), .{
+        @as(objc.NSUInteger, 0),
+        @as(u32, 1024),
+        format,
+        @as(objc.id, @ptrCast(&static_tap_block)),
+    });
+
+    const recognizer = createRecognizer(opts.locale) orelse return null;
+    const is_available = objc.msgSend(bool, recognizer, objc.sel("isAvailable"), .{});
+    if (!is_available) return null;
+
+    const request = startRecognitionTask(recognizer, opts.on_device) orelse return null;
+
+    var start_err: ?objc.id = null;
+    if (!objc.msgSend(bool, engine, objc.sel("startAndReturnError:"), .{&start_err})) {
+        return null;
+    }
+
+    return .{
+        .engine = engine,
+        .input_node = input_node,
+        .recognizer = recognizer,
+        .request = request,
+    };
+}
+
+/// Tear down an entire audio pipeline (engine, tap, task, request).
+fn teardownPipeline(p: AudioPipeline) void {
+    ignore_callbacks = true;
+
+    if (live_recognition_task) |task| {
+        objc.msgSend(void, task, objc.sel("cancel"), .{});
+        live_recognition_task = null;
+    }
+    objc.msgSend(void, p.request, objc.sel("endAudio"), .{});
+    live_recognition_request = null;
+
+    objc.msgSend(void, p.input_node, objc.sel("removeTapOnBus:"), .{@as(objc.NSUInteger, 0)});
+    objc.msgSend(void, p.engine, objc.sel("stop"), .{});
+
+    // Drain any pending callbacks (all ignored)
+    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+
+    recognition_done = false;
+    recognition_error = false;
+    recognition_text_changed = false;
+    ignore_callbacks = false;
+}
+
+pub fn listen(allocator: std.mem.Allocator, opts: speech.ListenOptions) speech.SpeechError!speech.TranscriptionResult {
+    const pool = objc.autoreleasePoolPush();
+    defer objc.autoreleasePoolPop(pool);
+
+    log_callback = opts.on_log;
+    try ensureAuthorized();
+
+    // Reset all global state
+    recognition_done = false;
+    recognition_error = false;
+    captured_len = 0;
+    captured_base_len = 0;
+    captured_changed = false;
+    audio_tap_count = 0;
+
+    current_run_loop = CFRunLoopGetCurrent();
+
+    var pipeline = buildPipeline(opts) orelse
+        return speech.SpeechError.FrameworkUnavailable;
+    log("[verbose] recognition task started");
+
+    // --- Poll loop ---
+    const poll_interval: f64 = 0.2;
+    const silence_timeout_s: f64 = @as(f64, @floatFromInt(opts.silence_timeout_ms)) / 1000.0;
+    const has_hard_duration = opts.duration_ms > 0;
+    const hard_duration_s: f64 = if (has_hard_duration)
+        @as(f64, @floatFromInt(opts.duration_ms)) / 1000.0
+    else
+        0;
+
+    var elapsed: f64 = 0;
+    var silence_elapsed: f64 = 0;
+    var time_since_last_capture: f64 = 0;
+    var prev_captured_len: usize = 0;
+    var last_status_time: f64 = 0;
+    var prev_tap_count: u64 = 0;
+
+    while (true) {
+        _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, poll_interval, false);
+        elapsed += poll_interval;
+
+        if (captured_changed) {
+            captured_changed = false;
+            // Any callback = activity, even revisions that shrink text
+            time_since_last_capture = 0;
+
+            if (captured_len > prev_captured_len) {
+                // Text grew — stream the new content
+                if (opts.on_partial) |cb| {
+                    cb(captured_buf[0..captured_len]);
+                }
+                silence_elapsed = 0;
+            }
+            prev_captured_len = captured_len;
+        } else {
+            time_since_last_capture += poll_interval;
+            if (captured_len > 0) {
+                silence_elapsed += poll_interval;
+            }
+        }
+
+        // --- Periodic status log (every 2s) ---
+        if (elapsed - last_status_time >= 2.0) {
+            const tap_delta = audio_tap_count - prev_tap_count;
+            var buf: [256]u8 = undefined;
+            const status_msg = std.fmt.bufPrint(&buf, "[verbose] status: mic={d}/2s, captured={d}, base={d}, silence={d:.1}s, stall={d:.1}s", .{
+                tap_delta,
+                captured_len,
+                captured_base_len,
+                silence_elapsed,
+                time_since_last_capture,
+            }) catch "[verbose] status: (fmt error)";
+            log(status_msg);
+            prev_tap_count = audio_tap_count;
+            last_status_time = elapsed;
+        }
+
+        // --- Need to restart? (task ended or stalled) ---
+        const needs_restart = recognition_done or
+            (time_since_last_capture >= 5.0 and captured_len > 0);
+
+        if (needs_restart) {
+            if (recognition_done) {
+                log("[verbose] recognition task ended");
+            } else {
+                log("[verbose] recognizer stalled (no callbacks for 5s)");
+            }
+
+            if (recognition_error and captured_len == 0) {
+                log("[verbose] error before any text, stopping");
+                break;
+            }
+
+            // Nuclear restart
+            log("[verbose] rebuilding pipeline...");
+            teardownPipeline(pipeline);
+            _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+
+            // Advance base so new task's text appends after what we have
+            captured_base_len = captured_len;
+            time_since_last_capture = 0;
+
+            pipeline = buildPipeline(opts) orelse {
+                log("[verbose] failed to rebuild pipeline");
+                break;
+            };
+            log("[verbose] pipeline rebuilt, recognition resumed");
+            continue;
+        }
+
+        // --- User requested stop ---
+        if (opts.stop_flag) |flag| {
+            if (flag.*) {
+                log("[verbose] stop requested");
+                break;
+            }
+        }
+
+        // --- Silence timeout (user-facing, 0 = disabled) ---
+        if (silence_timeout_s > 0 and captured_len > 0 and silence_elapsed >= silence_timeout_s) {
+            log("[verbose] silence timeout reached");
+            break;
+        }
+
+        // --- Hard duration limit ---
+        if (has_hard_duration and elapsed >= hard_duration_s) {
+            log("[verbose] duration limit reached");
+            break;
+        }
+    }
+
+    // --- Cleanup ---
+    teardownPipeline(pipeline);
+    current_run_loop = null;
+    log_callback = null;
+
+    if (captured_len == 0) {
         return speech.SpeechError.RecognitionFailed;
     }
 
-    const text_c = recognition_text.?;
-    const text = allocator.dupe(u8, text_c) catch return speech.SpeechError.OutOfMemory;
-    std.heap.c_allocator.free(@constCast(text_c));
-    recognition_text = null;
-
-    return .{ .text = text };
+    const final_text = allocator.dupe(u8, captured_buf[0..captured_len]) catch return speech.SpeechError.OutOfMemory;
+    return .{ .text = final_text };
 }
 
 // ---------------------------------------------------------------------------

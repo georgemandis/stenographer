@@ -27,14 +27,27 @@ pub const Locale = struct {
     identifier: []const u8,
 };
 
+pub const ListenOptions = struct {
+    locale: []const u8 = "en-US",
+    duration_ms: u32 = 0,
+    on_device: bool = false,
+    silence_timeout_ms: u32 = 3000,
+    /// Called with the current partial transcription text whenever it changes.
+    on_partial: ?*const fn (text: []const u8) void = null,
+    /// Called with debug messages when verbose mode is enabled.
+    on_log: ?*const fn (msg: []const u8) void = null,
+    /// When non-null, the listen loop checks this flag each poll and stops when true.
+    stop_flag: ?*bool = null,
+};
+
 /// Transcribe an audio file.
 pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool) SpeechError!TranscriptionResult {
     return platform.transcribeFile(allocator, path, locale, on_device);
 }
 
 /// Listen to the microphone and transcribe in real-time.
-pub fn listen(allocator: std.mem.Allocator, locale: []const u8, duration_ms: u32, on_device: bool) SpeechError!TranscriptionResult {
-    return platform.listen(allocator, locale, duration_ms, on_device);
+pub fn listen(allocator: std.mem.Allocator, opts: ListenOptions) SpeechError!TranscriptionResult {
+    return platform.listen(allocator, opts);
 }
 
 /// List available locales for speech recognition.
