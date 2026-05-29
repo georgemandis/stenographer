@@ -206,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try cmdTranscribe(&stdout.interface, allocator, path, locale, on_device, json_mode);
+        try cmdTranscribe(&stdout.interface, &stderr.interface, allocator, path, locale, on_device, json_mode, verbose);
     } else if (std.mem.eql(u8, command, "listen")) {
         const is_tty = stdout_file.isTty(init.io) catch false;
         const streaming = !no_stream and !json_mode and is_tty;
@@ -258,8 +258,14 @@ fn cmdLocales(writer: *std.Io.Writer, allocator: std.mem.Allocator, json_mode: b
     }
 }
 
-fn cmdTranscribe(writer: *std.Io.Writer, allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool, json_mode: bool) !void {
-    const result = speech.transcribeFile(allocator, path, locale, on_device) catch |err| {
+fn cmdTranscribe(writer: *std.Io.Writer, stderr: *std.Io.Writer, allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool, json_mode: bool, verbose: bool) !void {
+    if (verbose) {
+        log_writer = stderr;
+    }
+    defer {
+        log_writer = null;
+    }
+    const result = speech.transcribeFile(allocator, path, locale, on_device, if (verbose) &onLogMessage else null) catch |err| {
         return printSpeechError(writer, err);
     };
     defer speech.freeTranscription(allocator, result);

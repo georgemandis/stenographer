@@ -41,8 +41,8 @@ pub const ListenOptions = struct {
 };
 
 /// Transcribe an audio file.
-pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool) SpeechError!TranscriptionResult {
-    return platform.transcribeFile(allocator, path, locale, on_device);
+pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool, on_log: ?*const fn (msg: []const u8) void) SpeechError!TranscriptionResult {
+    return platform.transcribeFile(allocator, path, locale, on_device, on_log);
 }
 
 /// Listen to the microphone and transcribe in real-time.

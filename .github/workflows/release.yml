@@ -42,8 +42,11 @@ jobs:
         run: |
           VERSION="${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}"
           ARCHIVE_DIR="stenographer-${VERSION}-${{ matrix.archive_suffix }}"
-          mkdir -p "${ARCHIVE_DIR}"
+          mkdir -p "${ARCHIVE_DIR}/completions"
           cp zig-out/bin/stenographer "${ARCHIVE_DIR}/"
+          cp completions/stenographer.bash "${ARCHIVE_DIR}/completions/"
+          cp completions/stenographer.zsh "${ARCHIVE_DIR}/completions/"
+          cp completions/stenographer.fish "${ARCHIVE_DIR}/completions/"
           tar czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
           echo "ARCHIVE=${ARCHIVE_DIR}.tar.gz" >> "$GITHUB_ENV"
 

@@ -81,7 +81,7 @@ var ignore_callbacks: bool = false;
 // Audio tap counter: incremented every time the mic tap fires
 var audio_tap_count: u64 = 0;
 
-// --- Simple captured text ---
+// --- Simple captured text (live listen only) ---
 // captured_buf holds: [text from previous tasks] + \n + [current task's text]
 // On every callback, we replace the current task's portion with Apple's latest.
 // The streaming callback only advances when total length grows.
@@ -261,38 +261,94 @@ fn createRecognizer(locale: []const u8) ?objc.id {
 // Public API: transcribe file
 // ---------------------------------------------------------------------------
 
-pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool) speech.SpeechError!speech.TranscriptionResult {
+// ---------------------------------------------------------------------------
+// File transcription — standalone callback and state
+// ---------------------------------------------------------------------------
+var file_done: bool = false;
+var file_error: bool = false;
+var file_text: ?[]const u8 = null;
+var file_text_len: usize = 0;
+var file_callback_count: usize = 0;
+
+fn fileBlockInvoke(block: *RecognitionBlockLiteral, result: ?objc.id, err: ?objc.id) callconv(.c) void {
+    _ = block;
+    file_callback_count += 1;
+
+    if (err) |e| {
+        if (log_callback != null) {
+            const desc = objc.msgSend(objc.id, e, objc.sel("localizedDescription"), .{});
+            const desc_cstr = objc.fromNSString(desc);
+            if (desc_cstr) |cs| {
+                const slice = std.mem.sliceTo(cs, 0);
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "[verbose] transcribe error: {s}", .{slice}) catch "[verbose] transcribe error: (too long)";
+                log(msg);
+            }
+        }
+        file_error = file_text == null;
+        file_done = true;
+        if (current_run_loop) |rl| CFRunLoopStop(rl);
+        return;
+    }
+
+    if (result) |res| {
+        const is_final = objc.msgSend(bool, res, objc.sel("isFinal"), .{});
+        const transcription = objc.msgSend(objc.id, res, objc.sel("bestTranscription"), .{});
+        const formatted = objc.msgSend(objc.id, transcription, objc.sel("formattedString"), .{});
+        const cstr = objc.fromNSString(formatted) orelse {
+            if (is_final) {
+                file_done = true;
+                if (current_run_loop) |rl| CFRunLoopStop(rl);
+            }
+            return;
+        };
+
+        const apple_text = std.mem.sliceTo(cstr, 0);
+        if (file_text) |prev| {
+            std.heap.c_allocator.free(@constCast(prev));
+        }
+        file_text = std.heap.c_allocator.dupe(u8, apple_text) catch null;
+        file_text_len = apple_text.len;
+
+        if (is_final) {
+            log("[verbose] transcription complete (isFinal=true)");
+            file_done = true;
+            if (current_run_loop) |rl| CFRunLoopStop(rl);
+        }
+    }
+}
+
+pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []const u8, on_device: bool, on_log: ?*const fn (msg: []const u8) void) speech.SpeechError!speech.TranscriptionResult {
     const pool = objc.autoreleasePoolPush();
     defer objc.autoreleasePoolPop(pool);
 
+    log_callback = on_log;
+    defer log_callback = null;
+
     try ensureAuthorized();
 
-    // Reset state
-    recognition_done = false;
-    recognition_text = null;
-    recognition_error = false;
+    file_done = false;
+    file_error = false;
+    file_text = null;
+    file_text_len = 0;
+    file_callback_count = 0;
 
-    // Create recognizer
     const recognizer = createRecognizer(locale) orelse
         return speech.SpeechError.FrameworkUnavailable;
 
-    // Check availability
     const is_available = objc.msgSend(bool, recognizer, objc.sel("isAvailable"), .{});
     if (!is_available) return speech.SpeechError.FrameworkUnavailable;
 
-    // Create NSURL from file path
     const ns_path = objc.nsStringFromSlice(path.ptr, path.len) orelse
         return speech.SpeechError.FileNotFound;
     const NSURL = objc.getClass("NSURL") orelse return speech.SpeechError.FrameworkUnavailable;
     const file_url = objc.msgSend(objc.id, NSURL, objc.sel("fileURLWithPath:"), .{ns_path});
 
-    // Create SFSpeechURLRecognitionRequest
     const SFSpeechURLRecognitionRequest = objc.getClass("SFSpeechURLRecognitionRequest") orelse
         return speech.SpeechError.FrameworkUnavailable;
     const request_alloc = objc.msgSend(objc.id, SFSpeechURLRecognitionRequest, objc.sel("alloc"), .{});
     const request = objc.msgSend(objc.id, request_alloc, objc.sel("initWithURL:"), .{file_url});
 
-    // Set on-device if requested
     if (on_device) {
         const supports_on_device = objc.msgSend(bool, recognizer, objc.sel("supportsOnDeviceRecognition"), .{});
         if (supports_on_device) {
@@ -300,34 +356,66 @@ pub fn transcribeFile(allocator: std.mem.Allocator, path: []const u8, locale: []
         }
     }
 
-    // Create recognition block
+    log("[verbose] starting file transcription...");
+
     var block = RecognitionBlockLiteral{
         .isa = @ptrCast(&_NSConcreteStackBlock),
         .flags = 0,
         .reserved = 0,
-        .invoke = &recognitionBlockInvoke,
+        .invoke = &fileBlockInvoke,
         .descriptor = &recognition_block_descriptor,
     };
 
-    // Start recognition task
     current_run_loop = CFRunLoopGetCurrent();
     _ = objc.msgSend(objc.id, recognizer, objc.sel("recognitionTaskWithRequest:resultHandler:"), .{
         request,
         @as(objc.id, @ptrCast(&block)),
     });
 
-    // Pump run loop until done (timeout: 120s for long files)
-    _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 120.0, false);
+    // Poll loop so we can log progress
+    const poll_interval: f64 = 0.5;
+    var elapsed: f64 = 0;
+    var last_log_time: f64 = 0;
+    var prev_cb_count: usize = 0;
+
+    while (!file_done and elapsed < 120.0) {
+        _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, poll_interval, false);
+        elapsed += poll_interval;
+
+        if (elapsed - last_log_time >= 2.0) {
+            const cb_delta = file_callback_count - prev_cb_count;
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[verbose] transcribing... {d:.0}s elapsed, {d} chars, {d} updates (+{d})", .{
+                elapsed,
+                file_text_len,
+                file_callback_count,
+                cb_delta,
+            }) catch "[verbose] transcribing...";
+            log(msg);
+            prev_cb_count = file_callback_count;
+            last_log_time = elapsed;
+        }
+    }
     current_run_loop = null;
 
-    if (recognition_text == null) {
+    if (file_text == null) {
         return speech.SpeechError.RecognitionFailed;
     }
 
-    const text_c = recognition_text.?;
+    {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "[verbose] done: {d} chars in {d:.1}s ({d} updates)", .{
+            file_text_len,
+            elapsed,
+            file_callback_count,
+        }) catch "[verbose] done";
+        log(msg);
+    }
+
+    const text_c = file_text.?;
     const text = allocator.dupe(u8, text_c) catch return speech.SpeechError.OutOfMemory;
     std.heap.c_allocator.free(@constCast(text_c));
-    recognition_text = null;
+    file_text = null;
 
     return .{ .text = text };
 }
