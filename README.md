@@ -79,8 +79,8 @@ stenographer transcribe meeting.wav | lingua entities
 # Transcribe and analyze sentiment
 stenographer transcribe review.wav | lingua sentiment --per-sentence
 
-# Transcribe a rendered page's audio
-stenographer transcribe downloaded_audio.wav --on-device > transcript.txt
+# Save a transcript to a file
+stenographer transcribe meeting.wav --on-device > transcript.txt
 ```
 
 ## Options
