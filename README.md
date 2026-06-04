@@ -8,9 +8,20 @@ Written in Zig. Uses Apple's Speech and AVFoundation frameworks via Objective-C 
 
 ## Install
 
+### Homebrew
+
 ```bash
+brew install georgemandis/tap/stenographer
+```
+
+### From source
+
+Requires [Zig 0.16+](https://ziglang.org/download/) and macOS.
+
+```bash
+git clone https://github.com/georgemandis/stenographer.git
+cd stenographer
 zig build -Doptimize=ReleaseFast
-cp zig-out/bin/stenographer /usr/local/bin/
 ```
 
 ## Usage
