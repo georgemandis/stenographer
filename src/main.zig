@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const speech = @import("speech");
 
-const version = "0.2.0";
+const version = "0.2.2";
 
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.print(
@@ -294,8 +294,17 @@ var listen_stop_flag: bool = false;
 
 fn stdinWatchThread() void {
     const stdin_fd = std.posix.STDIN_FILENO;
+    var fds = [1]std.posix.pollfd{.{
+        .fd = stdin_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
     var buf: [1]u8 = undefined;
     while (!listen_stop_flag) {
+        // Poll with 200ms timeout so we can check stop_flag periodically
+        const ready = std.posix.poll(&fds, 200) catch break;
+        if (ready == 0) continue; // timeout, check flag
+        if (fds[0].revents & std.posix.POLL.IN == 0) continue;
         const n = std.posix.read(stdin_fd, &buf) catch break;
         if (n == 0) break;
         // Enter (0x0A or 0x0D) or Escape (0x1B)
