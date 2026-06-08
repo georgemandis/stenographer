@@ -34,6 +34,9 @@ pub const ListenOptions = struct {
     silence_timeout_ms: u32 = 3000,
     /// Called with the current partial transcription text whenever it changes.
     on_partial: ?*const fn (text: []const u8) void = null,
+    /// Called when the transcription text has been stable (unchanged) for ~1.5s.
+    /// The callback receives the full accumulated text at the moment of stability.
+    on_stable: ?*const fn (text: []const u8) void = null,
     /// Called with debug messages when verbose mode is enabled.
     on_log: ?*const fn (msg: []const u8) void = null,
     /// When non-null, the listen loop checks this flag each poll and stops when true.

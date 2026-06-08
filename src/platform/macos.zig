@@ -592,6 +592,9 @@ pub fn listen(allocator: std.mem.Allocator, opts: speech.ListenOptions) speech.S
     var prev_captured_len: usize = 0;
     var last_status_time: f64 = 0;
     var prev_tap_count: u64 = 0;
+    // Stability tracking: how long text has been unchanged, and what we last emitted
+    var stable_elapsed: f64 = 0;
+    var stable_emitted_len: usize = 0;
 
     while (true) {
         _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, poll_interval, false);
@@ -601,6 +604,7 @@ pub fn listen(allocator: std.mem.Allocator, opts: speech.ListenOptions) speech.S
             captured_changed = false;
             // Any callback = activity, even revisions that shrink text
             time_since_last_capture = 0;
+            stable_elapsed = 0;
 
             if (captured_len > prev_captured_len) {
                 // Text grew — stream the new content
@@ -614,6 +618,16 @@ pub fn listen(allocator: std.mem.Allocator, opts: speech.ListenOptions) speech.S
             time_since_last_capture += poll_interval;
             if (captured_len > 0) {
                 silence_elapsed += poll_interval;
+            }
+            stable_elapsed += poll_interval;
+        }
+
+        // Stability check: text unchanged for ~1.5s and we have new text to emit
+        if (opts.on_stable) |cb| {
+            if (stable_elapsed >= 1.5 and captured_len > stable_emitted_len) {
+                cb(captured_buf[0..captured_len]);
+                stable_emitted_len = captured_len;
+                stable_elapsed = 0;
             }
         }
 
@@ -684,6 +698,13 @@ pub fn listen(allocator: std.mem.Allocator, opts: speech.ListenOptions) speech.S
         if (has_hard_duration and elapsed >= hard_duration_s) {
             log("[verbose] duration limit reached");
             break;
+        }
+    }
+
+    // Emit any remaining stable text
+    if (opts.on_stable) |cb| {
+        if (captured_len > stable_emitted_len) {
+            cb(captured_buf[0..captured_len]);
         }
     }
 

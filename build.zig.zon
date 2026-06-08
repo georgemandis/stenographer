@@ -1,4 +1,5 @@
 .{
+    .fingerprint = 0xeb8da6a5772c3bd8,
     .name = .stenographer,
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",

@@ -24,8 +24,9 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --duration=MS      Max listen duration in ms (0=unlimited, default: 0)
         \\  --silence=MS       Stop after this many ms of silence (default: 3000, 0=disabled)
         \\  --no-stream        Don't print partial results while listening
+        \\  --stable           With --json, emit only when text stabilizes (experimental)
         \\  --verbose          Show debug info on stderr
-        \\  --json             Output as JSON
+        \\  --json             Output as JSON (streams NDJSON per update when listening)
         \\  --help, -h         Show this help message
         \\  --version, -v      Show version
         \\
@@ -75,6 +76,24 @@ fn onLogMessage(msg: []const u8) void {
 // Track how many lines we last printed so we can erase and rewrite
 var stream_last_line_count: usize = 0;
 var stream_term_width: usize = 80;
+
+// JSON streaming callback — emits NDJSON with full text on every partial update
+fn onJsonPartialResult(text: []const u8) void {
+    const writer = stream_writer orelse return;
+    writer.print("{{\"text\":\"", .{}) catch return;
+    writeJsonString(writer, text) catch return;
+    writer.print("\"}}\n", .{}) catch return;
+    writer.flush() catch return;
+}
+
+// Stable JSON streaming callback — emits NDJSON when text has been stable for ~1.5s
+fn onJsonStableResult(text: []const u8) void {
+    const writer = stream_writer orelse return;
+    writer.print("{{\"text\":\"", .{}) catch return;
+    writeJsonString(writer, text) catch return;
+    writer.print("\"}}\n", .{}) catch return;
+    writer.flush() catch return;
+}
 
 fn countDisplayLines(text: []const u8, width: usize) usize {
     if (text.len == 0) return 0;
@@ -160,6 +179,7 @@ pub fn main(init: std.process.Init) !void {
     var duration_ms: u32 = 0;
     var silence_ms: u32 = 3000;
     var no_stream = false;
+    var stable = false;
     var verbose = false;
     var file_path: ?[]const u8 = null;
 
@@ -170,6 +190,8 @@ pub fn main(init: std.process.Init) !void {
             on_device = true;
         } else if (std.mem.eql(u8, arg, "--no-stream")) {
             no_stream = true;
+        } else if (std.mem.eql(u8, arg, "--stable")) {
+            stable = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         } else if (std.mem.startsWith(u8, arg, "--locale=")) {
@@ -210,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "listen")) {
         const is_tty = stdout_file.isTty(init.io) catch false;
         const streaming = !no_stream and !json_mode and is_tty;
+        const json_streaming = !no_stream and json_mode;
         try cmdListen(&stdout.interface, &stderr.interface, allocator, .{
             .locale = locale,
             .duration_ms = duration_ms,
@@ -217,6 +240,8 @@ pub fn main(init: std.process.Init) !void {
             .silence_ms = silence_ms,
             .json_mode = json_mode,
             .streaming = streaming,
+            .json_streaming = json_streaming,
+            .stable = stable,
             .verbose = verbose,
         });
     } else {
@@ -286,6 +311,8 @@ const ListenCmdOpts = struct {
     silence_ms: u32,
     json_mode: bool,
     streaming: bool,
+    json_streaming: bool,
+    stable: bool,
     verbose: bool,
 };
 
@@ -337,15 +364,17 @@ fn cmdListen(writer: *std.Io.Writer, stderr: *std.Io.Writer, allocator: std.mem.
     }
 
     // Set up streaming callback
-    if (opts.streaming) {
+    if (opts.streaming or opts.json_streaming) {
         stream_writer = writer;
         stream_last_line_count = 0;
-        // Get terminal width via ioctl
-        stream_term_width = blk: {
-            var ws: std.posix.winsize = undefined;
-            const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-            break :blk if (rc == 0 and ws.col > 0) @as(usize, ws.col) else 80;
-        };
+        if (opts.streaming) {
+            // Get terminal width via ioctl
+            stream_term_width = blk: {
+                var ws: std.posix.winsize = undefined;
+                const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+                break :blk if (rc == 0 and ws.col > 0) @as(usize, ws.col) else 80;
+            };
+        }
     } else {
         stream_writer = null;
     }
@@ -388,12 +417,29 @@ fn cmdListen(writer: *std.Io.Writer, stderr: *std.Io.Writer, allocator: std.mem.
         }
     }
 
+    // Choose the right partial callback:
+    // - TTY streaming: live rewriting partial display
+    // - JSON streaming (no --stable): NDJSON on every partial change
+    // - JSON streaming (--stable): no partial callback, use on_stable instead
+    const partial_cb: ?*const fn ([]const u8) void = if (opts.streaming)
+        &onPartialResult
+    else if (opts.json_streaming and !opts.stable)
+        &onJsonPartialResult
+    else
+        null;
+
+    const stable_cb: ?*const fn ([]const u8) void = if (opts.json_streaming and opts.stable)
+        &onJsonStableResult
+    else
+        null;
+
     const result = speech.listen(allocator, .{
         .locale = opts.locale,
         .duration_ms = opts.duration_ms,
         .on_device = opts.on_device,
         .silence_timeout_ms = opts.silence_ms,
-        .on_partial = if (opts.streaming) &onPartialResult else null,
+        .on_partial = partial_cb,
+        .on_stable = stable_cb,
         .on_log = if (opts.verbose) &onLogMessage else null,
         .stop_flag = if (stdin_is_tty) &listen_stop_flag else null,
     }) catch |err| {
@@ -407,7 +453,9 @@ fn cmdListen(writer: *std.Io.Writer, stderr: *std.Io.Writer, allocator: std.mem.
     stream_writer = null;
     log_writer = null;
 
-    if (opts.streaming) {
+    if (opts.json_streaming) {
+        // Utterances already emitted via on_utterance callback — nothing more to print
+    } else if (opts.streaming) {
         // Final rewrite: erase streaming output and print clean result
         if (stream_last_line_count > 0) {
             try writer.print("\x1b[{d}A\r", .{stream_last_line_count});
